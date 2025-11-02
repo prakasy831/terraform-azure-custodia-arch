@@ -7,7 +7,8 @@ module "bns_rg" {
   location = "East US"
 }
 
-# =======================#  INSIGHTS VNET
+# =======================
+#  INSIGHTS VNET
 # =======================
 module "insights_vnet" {
   source              = "./modules/vnet"
@@ -86,35 +87,34 @@ module "mgmt_vnet" {
   resource_group_name = module.bns_rg.name
 
   subnets = [
-    { name = "bastion", address_prefix = "10.200.194.0/24" },
+    { name = "AzureBastionSubnet", address_prefix = "10.200.194.0/24" },
     { name = "jumpbox", address_prefix = "10.200.195.0/24" },
     { name = "monitor", address_prefix = "10.200.196.0/24" },
   ]
 }
+
 # =======================
-# NSG for C2C Web Subnet
+# NSGs
 # =======================
 module "c2c_web_nsg" {
   source              = "./modules/nsg"
   nsg_name            = "C2C-Web-NSG"
   location            = module.bns_rg.location
-  resource_group_name = module.bns_rg.name # ✅ changed from rg_name to name
+  resource_group_name = module.bns_rg.name
   subnet_id           = module.c2c_vnet.subnet_ids["web"]
 }
 
-# =======================
-# NSG for Mgmt Bastion Subnet
-# =======================
-module "mgmt_bastion_nsg" {
-  source              = "./modules/nsg"
-  nsg_name            = "Mgmt-Bastion-NSG"
-  location            = module.bns_rg.location
-  resource_group_name = module.bns_rg.name # ✅ changed from rg_name to name
-  subnet_id           = module.mgmt_vnet.subnet_ids["bastion"]
-}
+#module "mgmt_bastion_nsg" {
+# source              = "./modules/nsg"
+#nsg_name            = "Mgmt-Bastion-NSG"
+#location            = module.bns_rg.location
+#resource_group_name = module.bns_rg.name
+#subnet_id           = module.mgmt_vnet.subnet_ids["AzureBastionSubnet"]
+#}
 
-
-# C2C → CC1
+# =======================
+# VNET PEERINGS
+# =======================
 module "peering_c2c_to_cc1" {
   source              = "./modules/peering"
   resource_group_name = module.bns_rg.name
@@ -123,7 +123,6 @@ module "peering_c2c_to_cc1" {
   remote_vnet_id      = module.cc1_vnet.vnet_id
 }
 
-# CC1 → C2C (reverse link)
 module "peering_cc1_to_c2c" {
   source              = "./modules/peering"
   resource_group_name = module.bns_rg.name
@@ -132,7 +131,6 @@ module "peering_cc1_to_c2c" {
   remote_vnet_id      = module.c2c_vnet.vnet_id
 }
 
-# CC1 → Insights
 module "peering_cc1_to_insights" {
   source              = "./modules/peering"
   resource_group_name = module.bns_rg.name
@@ -141,7 +139,6 @@ module "peering_cc1_to_insights" {
   remote_vnet_id      = module.insights_vnet.vnet_id
 }
 
-# Insights → CC1 (reverse link)
 module "peering_insights_to_cc1" {
   source              = "./modules/peering"
   resource_group_name = module.bns_rg.name
@@ -149,8 +146,9 @@ module "peering_insights_to_cc1" {
   remote_vnet_name    = module.cc1_vnet.vnet_name
   remote_vnet_id      = module.cc1_vnet.vnet_id
 }
+
 # =======================
-# FIREWALL SUBNET + FIREWALL
+# FIREWALL SUBNET
 # =======================
 resource "azurerm_subnet" "firewall_subnet" {
   name                 = "AzureFirewallSubnet"
@@ -159,12 +157,26 @@ resource "azurerm_subnet" "firewall_subnet" {
   address_prefixes     = ["10.200.197.0/26"]
 }
 
+# =======================
+# FIREWALL POLICY
+# =======================
+module "firewall_policy" {
+  source              = "./modules/firewall_policy"
+  policy_name         = "Custodia-FW-Policy"
+  location            = module.bns_rg.location
+  resource_group_name = module.bns_rg.name
+}
+
+# =======================
+# FIREWALL
+# =======================
 module "azure_firewall" {
   source              = "./modules/firewall"
   firewall_name       = "Custodia-Firewall"
   location            = module.bns_rg.location
   resource_group_name = module.bns_rg.name
   subnet_id           = azurerm_subnet.firewall_subnet.id
+  firewall_policy_id  = module.firewall_policy.firewall_policy_id
 }
 
 # =======================
@@ -176,7 +188,6 @@ resource "azurerm_route_table" "firewall_routetable" {
   resource_group_name = module.bns_rg.name
 }
 
-# Define a route that sends all outbound traffic to the firewall
 resource "azurerm_route" "default_route" {
   name                   = "default-to-firewall"
   resource_group_name    = module.bns_rg.name
@@ -186,9 +197,93 @@ resource "azurerm_route" "default_route" {
   next_hop_in_ip_address = module.azure_firewall.firewall_private_ip
 }
 
-# Associate the route table with a subnet (for example, C2C web subnet)
 resource "azurerm_subnet_route_table_association" "web_rt_assoc" {
   subnet_id      = module.c2c_vnet.subnet_ids["web"]
   route_table_id = azurerm_route_table.firewall_routetable.id
+}
+
+# =======================
+# HUB-SPOKE PEERING
+# =======================
+module "peering_mgmt_to_c2c" {
+  source                = "./modules/peering"
+  resource_group_name   = module.bns_rg.name
+  source_vnet_name      = module.mgmt_vnet.vnet_name
+  remote_vnet_name      = module.c2c_vnet.vnet_name
+  remote_vnet_id        = module.c2c_vnet.vnet_id
+  allow_gateway_transit = true
+  use_remote_gateways   = false
+}
+
+module "peering_c2c_to_mgmt" {
+  source                = "./modules/peering"
+  resource_group_name   = module.bns_rg.name
+  source_vnet_name      = module.c2c_vnet.vnet_name
+  remote_vnet_name      = module.mgmt_vnet.vnet_name
+  remote_vnet_id        = module.mgmt_vnet.vnet_id
+  allow_gateway_transit = false
+  use_remote_gateways   = false
+}
+
+module "peering_cc1_to_mgmt" {
+  source                = "./modules/peering"
+  resource_group_name   = module.bns_rg.name
+  source_vnet_name      = module.cc1_vnet.vnet_name
+  remote_vnet_name      = module.mgmt_vnet.vnet_name
+  remote_vnet_id        = module.mgmt_vnet.vnet_id
+  allow_gateway_transit = false
+  use_remote_gateways   = false
+}
+
+# =======================
+# LOG ANALYTICS + DIAGNOSTICS
+# =======================
+resource "azurerm_log_analytics_workspace" "firewall_logs" {
+  name                = "Custodia-FW-Logs"
+  location            = module.bns_rg.location
+  resource_group_name = module.bns_rg.name
+  sku                 = "PerGB2018"
+  retention_in_days   = 30
+}
+
+resource "azurerm_monitor_diagnostic_setting" "firewall_diagnostics" {
+  name                       = "Custodia-Firewall-Diagnostics"
+  target_resource_id         = module.azure_firewall.firewall_id
+  log_analytics_workspace_id = azurerm_log_analytics_workspace.firewall_logs.id
+
+  enabled_log {
+    category = "AzureFirewallApplicationRule"
+  }
+
+  enabled_log {
+    category = "AzureFirewallNetworkRule"
+  }
+
+  enabled_metric {
+    category = "AllMetrics"
+  }
+}
+# =======================
+#  AZURE BASTION
+# =======================
+module "bastion" {
+  source              = "./modules/bastion"
+  resource_group_name = module.bns_rg.name
+  location            = module.bns_rg.location
+  subnet_id           = module.mgmt_vnet.subnet_ids["AzureBastionSubnet"]
+}
+
+# =======================
+#  JUMPBOX VM
+# =======================
+module "jumpbox" {
+  source              = "./modules/jumpbox"
+  resource_group_name = module.bns_rg.name
+  location            = module.bns_rg.location
+  subnet_id           = module.mgmt_vnet.subnet_ids["jumpbox"]
+  vm_name             = "Custodia-Jump"
+  admin_username      = "azureadmin"
+  admin_password      = "P@ssw0rd1234!" # replace with Key Vault later
+  enable_public_ip    = false
 }
 
